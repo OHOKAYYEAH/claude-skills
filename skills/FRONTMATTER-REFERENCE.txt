@@ -1,0 +1,187 @@
+# Claude Code Skill Frontmatter Reference
+
+Quick reference for building skills in ~/.claude/skills/<name>/SKILL.md
+
+Every skill is a markdown file with YAML frontmatter between --- markers.
+Everything below the closing --- is the prompt Claude sees when invoked.
+
+## Minimal skill
+
+    ---
+    name: my-skill
+    description: What this skill does, in one line.
+    ---
+
+    Prompt content goes here. Use $ARGUMENTS for user input.
+
+The folder name must match the `name:` field. That's what becomes /my-skill.
+
+
+## Frontmatter fields
+
+name                      (required)
+  The slash command. Must match the parent folder name.
+  Example: name: plan-review  ->  /plan-review
+
+description               (required)
+  One-line summary. Used by Claude to decide whether to auto-invoke the
+  skill based on conversation context. Write it even if you're disabling
+  auto-invocation — it's also what you see when browsing /skills.
+
+disable-model-invocation  (optional, default: false)
+  true  = user-only. Claude will never auto-invoke. Pure slash command.
+  false = Claude can auto-invoke based on description match.
+  Set to true for anything with side effects or that you want to gate
+  deliberately (deploy, commit, plan-review, etc.).
+
+user-invocable            (optional, default: true)
+  false = hide from the / menu. Only Claude can invoke it.
+  Use for background knowledge skills ("legacy-system-context") that
+  aren't meaningful as user actions.
+
+allowed-tools             (optional)
+  Space-separated list of tools the skill can use without permission
+  prompts while active. Does NOT restrict other tools — just pre-approves
+  these. Uses the same syntax as permission rules.
+  Example:
+    allowed-tools: Bash(git add *) Bash(git commit *) Read Edit
+
+model                     (optional)
+  Pin a specific model for this skill. Useful for expensive-but-important
+  skills (security audits on opus) or cheap-and-fast ones (quick lookups
+  on haiku).
+  Example: model: claude-opus-5-5
+
+argument-hint             (optional)
+  Shown in the UI to hint what args the skill expects. Purely cosmetic.
+  Example: argument-hint: [pr-number] [priority]
+
+context                   (optional)
+  Set to "fork" to run the skill in an isolated sub-conversation. Keeps
+  the main conversation context clean. Results are summarized back.
+  Pairs with the `agent:` field.
+
+background                (optional, only with context: fork)
+  Forked skills run in the background by default (CLI 2.1.218+): the caller
+  gets an agent name, and the report arrives later as a notification. Set
+  `background: false` when a caller reads the result before continuing.
+  Every skill another skill chains (and waits on) needs it.
+  Example: background: false
+
+agent                     (optional)
+  Which subagent to use when context: fork is set.
+  Options: Explore, Plan, general-purpose, or any custom agent from
+  .claude/agents/. Defaults to general-purpose.
+
+
+## Portability: write STRICT YAML
+
+Claude Code's frontmatter parser is lenient; every other SKILL.md consumer
+(OpenCode, Codex, Cursor...) uses a strict YAML parser and silently DROPS a
+skill whose frontmatter fails to parse. Two patterns cause nearly all failures:
+
+  argument-hint: [foo] [bar]          BAD  - a bare [ opens a YAML flow sequence
+  argument-hint: "[foo] [bar]"        GOOD - quote any value starting with [
+
+  description: Do X. Not Y: use /z    BAD  - ": " mid-value ends the scalar
+  description: "Do X. Not Y: use /z"  GOOD - quote any value containing ": "
+
+Rule of thumb: if the value starts with [ { " ' * & ! | > % @ ` or contains
+": " or " #", double-quote it (JSON-style escapes). Check the whole suite:
+
+  python3 -c 'import yaml,re,glob
+for f in sorted(glob.glob("*/SKILL.md")):
+    try: yaml.safe_load(re.match(r"^---\n(.*?)\n---\n",open(f).read(),re.S).group(1))
+    except Exception as e: print("FAIL",f,"::",str(e).splitlines()[0])'
+
+Loop over EVERY file and print each failure. A bare list-comprehension
+check raises on the first bad file and never checks the rest, so it
+under-reports the count of broken skills.
+
+
+## Argument substitution
+
+Inside the skill body, these get replaced before Claude sees the prompt:
+
+$ARGUMENTS            Full argument string after the command
+$1, $2, $3, ...       Positional args (space-separated)
+$ARGUMENTS[0]         Same as $1 (alternate syntax)
+${CLAUDE_SESSION_ID}  Current session ID
+${CLAUDE_SKILL_DIR}   Absolute path to this skill's directory
+
+Example:
+    Fix issue #$1 with priority $2.
+
+Invoked as /fix-issue 347 high  ->  Claude sees:
+    Fix issue #347 with priority high.
+
+
+## Shell command injection
+
+Prefix a line with ! and wrap a command in backticks to run it BEFORE
+the skill content is sent to Claude. The output gets embedded in place.
+
+Example:
+    ---
+    name: smart-commit
+    description: Commit staged changes with a generated message
+    disable-model-invocation: true
+    ---
+
+    Current status: !`git status --short`
+    Staged diff: !`git diff --cached`
+    Recent commits: !`git log --oneline -5`
+
+    Generate a commit message for the staged changes and commit them.
+
+
+## Scope / where skills live
+
+~/.claude/skills/<name>/SKILL.md      Personal — all your projects
+.claude/skills/<name>/SKILL.md        Project — checked into that repo
+
+Name conflicts: enterprise > personal > project.
+
+Legacy ~/.claude/commands/<name>.md files still work but are deprecated.
+Migrate them to the skills format when convenient.
+
+
+## Common patterns
+
+Pure slash command (no auto-invoke):
+    ---
+    name: my-command
+    description: ...
+    disable-model-invocation: true
+    ---
+
+Auto-invoked helper Claude pulls in when relevant:
+    ---
+    name: my-helper
+    description: Very specific trigger conditions so it fires at the right time.
+    ---
+
+Side-effecting command with pre-approved tools:
+    ---
+    name: deploy
+    description: Deploy to production
+    disable-model-invocation: true
+    allowed-tools: Bash(./deploy.sh *) Bash(git *)
+    ---
+
+Research skill that runs in an isolated fork:
+    ---
+    name: deep-dive
+    description: Research a topic thoroughly without polluting main context
+    disable-model-invocation: true
+    context: fork
+    agent: Explore
+    ---
+
+
+## Discovery
+
+Type / in Claude Code to see all available skills and commands.
+Run /skills for a full list including built-ins.
+
+Official docs: https://code.claude.com/docs/en/skills

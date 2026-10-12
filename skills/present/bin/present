@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+# summary: Render pictures or a markdown doc as one styled HTML page (engine behind /present).
+"""present — render pictures or a markdown doc as ONE styled HTML page.
+
+The engine behind the /present skill: every page that goes in front of the user is
+built here, so sheets and documents share one design and callers never
+hand-write HTML (base64 never passes through a tool call).
+
+    present sheet sheet.json [-o out.html] [--linked] [--open] [--pdf]
+    present doc report.md [more.md ...] [--open] [--no-follow] [--pdf]
+
+Prints the path of each page it writes (for sheets, also the frame count).
+
+SHEET — screenshots + captions from a JSON manifest. Output is self-contained
+(images embedded as data: URIs) and lands beside the manifest as
+<tag-or-title>-<kind>.html unless -o says otherwise. --linked copies the images
+to <out dir>/shots/ and references them relatively instead: the form an
+Artifact publishes, with shots/ as supporting files. Manifest (only "title" and
+"sections" are required; relative "src" paths resolve against the manifest):
+
+    {
+      "title": "Onboarding wizard",
+      "tag": "TICKET-612",
+      "kind": "pre-push preview",
+      "intro": "Real build on the hybrid FE, signed in as the fixture user.",
+      "provenance": "Only when part of the sheet is illustrative, not captured.",
+      "meta": [["Branch", "ticket-612-onboarding"], ["Widths", "1440 · 390"]],
+      "scenarios": [{"verdict": "pass", "text": "Skip link", "frames": "01–02"}],
+      "sections": [{
+        "heading": "Step 1 — Connect your account",
+        "caption": "The design calls baked in, so feedback is targeted.",
+        "frames": [
+          {"src": "step1-1440.png", "label": "desktop", "viewport": "1440"},
+          {"src": "step1-390.png", "label": "phone", "viewport": "390"}
+        ],
+        "notes": [["copy", "Name in full everywhere."], "An untagged note."]
+      }],
+      "closing": "Not on this sheet, by necessity: ...",
+      "access": [["ctrl+]", "Reopens this sheet."]],
+      "footer": ["my-app", "ticket-612-onboarding"]
+    }
+
+Text fields accept `code` and **bold**; everything else is escaped. A frame's
+"label" of before/after colours it as half of a pair. Frames in one section
+share a row at one scale (columns sized by CSS width: "width", else the number
+leading "viewport", else pixel width), so a phone frame sits beside a desktop
+frame at true relative size.
+
+DOC — markdown rendered to a read-only copy at ~/.cache/present/<hash>/<stem>.html,
+so the source can't be edited by accident. Local images are embedded, so the
+page survives being sent as one file. Relative .md links are rendered too and
+point at those renders (local use only); --no-follow skips them.
+
+--open hands each page to $PRESENT_OPENER if set (any command that takes a URL),
+else xdg-open (Linux) or open (macOS). Without it nothing opens: the caller
+decides delivery.
+
+--pdf also prints each page to a .pdf beside it (headless Chromium, a throwaway
+profile). The page's print stylesheet forces the light theme, keeps every frame
+on one page and drops the viewer controls; a sheet whose frames are mostly wider
+than tall prints landscape. For sending to people who won't open an HTML file.
+
+One design for every page, whatever the project — no per-repo themes.
+
+Load-bearing in the sheet viewer:
+  - No target="_blank" and no links out: an Artifact's sandbox blocks top-level
+    navigation, so enlargement happens in-page via the lightbox.
+  - Arrow keys flip frames while HOLDING zoom + scroll, which turns a
+    before/after pair into a blink comparator.
+"""
+
+import argparse
+import base64
+import datetime
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
+}
+VERDICTS = {"pass", "note", "fail"}
+ARTIFACT_PAGE_LIMIT = 15 * 1024 * 1024
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "present"
+MAX_DOCS = 60  # a runaway link graph shouldn't render the whole repo
+
+
+def die(msg):
+    print(f"present: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def inline(text):
+    out = html.escape(str(text), quote=False)
+    out = re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+
+
+def attr(text):
+    return html.escape(str(text), quote=True)
+
+
+def data_uri(path):
+    return f"data:{MIME[path.suffix.lower()]};base64," + base64.b64encode(path.read_bytes()).decode()
+
+
+def image_size(path):
+    data = path.read_bytes()[:65536]
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", data[16:24])
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", data[i + 5 : i + 9])
+                return w, h
+            i += 2 + struct.unpack(">H", data[i + 2 : i + 4])[0]
+    return None
+
+
+def slugify(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "page"
+
+
+def page(title, body, extra_css="", script="", orientation="portrait"):
+    return (
+        PAGE.replace("{{TITLE}}", attr(title))
+        .replace("{{EXTRA_CSS}}", extra_css)
+        .replace("{{PRINT_CSS}}", PRINT_CSS.replace("{{ORIENTATION}}", orientation))
+        .replace("{{BODY}}", body)
+        .replace("{{SCRIPT}}", script)
+    )
+
+
+# ---------------------------------------------------------------- sheet
+
+
+def css_width(frame, pixels):
+    if frame.get("width"):
+        return int(frame["width"])
+    m = re.match(r"\s*(\d+)", str(frame.get("viewport", "")))
+    if m:
+        return int(m.group(1))
+    return pixels[0] if pixels else 1
+
+
+def build_sheet(manifest, base, out, linked):
+    sections = manifest.get("sections") or die('manifest needs "sections"')
+    title = manifest.get("title") or die('manifest needs "title"')
+    tag = manifest.get("tag", "")
+    kind = manifest.get("kind", "proof sheet")
+
+    rendered = []
+    number = 0
+    copied = []
+    wide = 0
+    for s_index, section in enumerate(sections):
+        frames = section.get("frames") or []
+        cells = []
+        widths = []
+        for frame in frames:
+            src = frame.get("src") or die(f"section {s_index + 1}: a frame has no src")
+            path = (base / src).expanduser().resolve()
+            if not path.is_file():
+                die(f"missing image {path} (capture it or drop the frame; never describe one)")
+            if path.suffix.lower() not in MIME:
+                die(f"unsupported image type {path.suffix}")
+            number += 1
+            nn = f"{number:02d}"
+            pixels = image_size(path)
+            widths.append(css_width(frame, pixels))
+            if pixels and pixels[0] > pixels[1]:
+                wide += 1
+
+            if linked:
+                rel = f"shots/{nn}-{path.name}"
+                dest = out.parent / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, dest)
+                copied.append((rel, path))
+                img_src = rel
+            else:
+                img_src = data_uri(path)
+
+            label = frame.get("label", "")
+            state = label.lower() if label.lower() in ("before", "after") else ""
+            dims = " · ".join(
+                x for x in (frame.get("viewport", ""), f"{pixels[0]}×{pixels[1]}" if pixels else "") if x
+            )
+            head_title = " · ".join(x for x in (f"Frame {nn}", label, dims, section.get("heading", "")) if x)
+            label_html = f'<span class="frame-state {state}">{inline(label)}</span>' if label else ""
+            caption = f"<figcaption>{inline(frame['caption'])}</figcaption>" if frame.get("caption") else ""
+            alt = frame.get("alt") or " — ".join(x for x in (section.get("heading", ""), label) if x) or f"frame {nn}"
+            cells.append(
+                f'<figure class="frame"><div class="frame-head"><span class="frame-no">{nn}</span>{label_html}'
+                f'<span class="frame-dims">{inline(dims)}</span></div>'
+                f'<button class="shot" type="button" data-title="{attr(head_title)}">'
+                f'<img src="{img_src}" alt="{attr(alt)}"></button>{caption}</figure>'
+            )
+
+        if cells and len(cells) <= 4:
+            columns = " ".join(f"minmax(0,{w}fr)" for w in widths)
+            strip = f'<div class="strip row" style="--cols:{columns}">{"".join(cells)}</div>'
+        elif cells:
+            strip = f'<div class="strip wrap">{"".join(cells)}</div>'
+        else:
+            strip = ""
+
+        notes = []
+        for note in section.get("notes") or []:
+            if isinstance(note, list):
+                notes.append(f'<li><span class="pill">{inline(note[0])}</span>{inline(note[1])}</li>')
+            else:
+                notes.append(f"<li>{inline(note)}</li>")
+
+        rendered.append(
+            '<section class="surface">'
+            + (
+                f'<div class="surface-h"><span class="surface-no">{s_index + 1:02d}</span>'
+                f"<h2>{inline(section['heading'])}</h2></div>"
+                if section.get("heading")
+                else ""
+            )
+            + (f'<p class="caption">{inline(section["caption"])}</p>' if section.get("caption") else "")
+            + strip
+            + (f'<ul class="notes">{"".join(notes)}</ul>' if notes else "")
+            + "</section>"
+        )
+
+    if number == 0:
+        die("no frames — a proof sheet with no captured image is not a proof sheet")
+
+    parts = [
+        '<header class="masthead">',
+        f'<span class="ticket">{inline(tag)}</span>' if tag else "",
+        f"<h1>{inline(title)}</h1>",
+        f'<span class="sheet-kind">{inline(kind)}</span>',
+        "</header>",
+    ]
+    if manifest.get("intro"):
+        parts.append(f'<p class="intro">{inline(manifest["intro"])}</p>')
+    if manifest.get("provenance"):
+        parts.append(
+            '<div class="callout provenance"><span class="callout-mark">Illustrative</span>'
+            f'<p>{inline(manifest["provenance"])}</p></div>'
+        )
+    meta = list(manifest.get("meta") or []) + [["Frames", str(number)]]
+    parts.append(
+        '<dl class="meta">'
+        + "".join(f"<div><dt>{inline(k)}</dt><dd>{inline(v)}</dd></div>" for k, v in meta)
+        + "</dl>"
+    )
+    if manifest.get("scenarios"):
+        rows = []
+        for sc in manifest["scenarios"]:
+            verdict = sc.get("verdict", "pass")
+            if verdict not in VERDICTS:
+                die(f"scenario verdict must be one of {sorted(VERDICTS)}, got {verdict!r}")
+            ref = f'<span class="frame-ref">{inline(sc["frames"])}</span>' if sc.get("frames") else ""
+            rows.append(f'<li><span class="verdict {verdict}">{verdict.upper()}</span>{inline(sc["text"])}{ref}</li>')
+        parts.append(f'<section><p class="block-label">Scenarios walked</p><ul class="scenarios">{"".join(rows)}</ul></section>')
+    parts.append('<p class="block-label viewer-hint">Click a frame to enlarge · ← → flips frames, holding zoom · Esc closes</p>')
+    parts.extend(rendered)
+    if manifest.get("closing"):
+        parts.append(
+            '<div class="callout closing"><span class="callout-mark">Not on this sheet</span>'
+            f'<p>{inline(manifest["closing"])}</p></div>'
+        )
+    if manifest.get("access"):
+        items = "".join(f"<li><kbd>{inline(k)}</kbd>{inline(v)}</li>" for k, v in manifest["access"])
+        parts.append(f'<section class="access"><p class="block-label">Getting back here</p><ul>{items}</ul></section>')
+    footer = [f"Assembled {datetime.date.today().isoformat()}"] + list(manifest.get("footer") or [])
+    parts.append("<footer>" + "".join(f"<span>{inline(f)}</span>" for f in footer) + "</footer>")
+
+    body = '<div class="sheet">\n' + "\n".join(p for p in parts if p) + "\n</div>\n" + LIGHTBOX
+    out.parent.mkdir(parents=True, exist_ok=True)
+    orientation = "landscape" if wide * 2 > number else "portrait"
+    out.write_text(page(f"{tag} {title}".strip(), body, SHEET_CSS, LIGHTBOX_JS, orientation), encoding="utf-8")
+    return number, copied
+
+
+# ---------------------------------------------------------------- doc
+
+DOC_EXTENSIONS = ["extra", "codehilite", "sane_lists", "toc", "admonition"]
+DOC_EXTENSION_CONFIGS = {"codehilite": {"guess_lang": False}, "toc": {"permalink": "#"}}
+LINK_RE = re.compile(r'(?P<attr>href|src)="(?P<url>[^"]+)"')
+
+
+def doc_out(src):
+    # Hash the absolute path so same-named docs can't collide; keep the stem as
+    # the filename so a sent copy stays recognisable.
+    digest = hashlib.sha1(str(src).encode()).hexdigest()[:10]
+    return CACHE / digest / f"{src.stem}.html"
+
+
+def code_css():
+    from pygments.formatters import HtmlFormatter
+
+    light = HtmlFormatter(style="default").get_style_defs(".codehilite")
+    dark_sel = ':root:not([data-theme="light"]) .codehilite'
+    dark = HtmlFormatter(style="monokai").get_style_defs(dark_sel)
+    forced = HtmlFormatter(style="monokai").get_style_defs(':root[data-theme="dark"] .codehilite')
+    return f"{light}\n@media (prefers-color-scheme: dark) {{\n{dark}\n}}\n{forced}\n"
+
+
+def rewrite_links(body, src, queue, follow):
+    def repl(m):
+        url = m.group("url")
+        if urlsplit(url).scheme or url.startswith(("#", "//", "mailto:")):
+            return m.group(0)
+        frag = ""
+        if "#" in url:
+            url, frag = url.split("#", 1)
+            frag = "#" + frag
+        if not url:
+            return m.group(0)
+        target = (src.parent / unquote(url)).resolve()
+        if m.group("attr") == "src" and target.is_file() and target.suffix.lower() in MIME:
+            return f'src="{data_uri(target)}"'
+        if target.suffix.lower() in (".md", ".markdown") and target.is_file():
+            if follow and target not in queue:
+                queue.append(target)
+            return f'{m.group("attr")}="{doc_out(target).as_uri()}{frag}"'
+        if target.exists():
+            return f'{m.group("attr")}="{target.as_uri()}{frag}"'
+        return m.group(0)
+
+    return LINK_RE.sub(repl, body)
+
+
+def render_doc(src, queue, follow):
+    try:
+        import markdown
+    except ImportError:
+        die("doc mode needs python3-markdown + python3-pygments")
+    text = src.read_text(encoding="utf-8")
+    md = markdown.Markdown(extensions=DOC_EXTENSIONS, extension_configs=DOC_EXTENSION_CONFIGS)
+    body = rewrite_links(md.convert(text), src, queue, follow)
+    body = body.replace("<table>", '<div class="tablewrap"><table>').replace("</table>", "</table></div>")
+
+    title = next((l.lstrip("# ").strip() for l in text.splitlines() if l.startswith("# ")), src.name)
+    mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(src.stat().st_mtime))
+    bar = f'<div class="bar"><span class="path">{html.escape(str(src))}</span><span>modified {mtime}</span></div>'
+    dest = doc_out(src)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(page(title, f'{bar}\n<main class="doc">{body}</main>', DOC_CSS + code_css()), encoding="utf-8")
+    return dest
+
+
+# ---------------------------------------------------------------- design
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground: #E7E8E4; --surface: #FBFBF9; --sunk: #DEE0DB;
+    --ink: #1A1C19; --ink-soft: #585C55; --rule: #C7C9C2;
+    --accent: #2B5E8E; --accent-soft: rgba(43, 94, 142, 0.12);
+    --pass: #3F7D55; --fail: #9B2C2C; --note: #8A6D1F;
+    --display: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --body: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --data: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #15171A; --surface: #1E2126; --sunk: #101215;
+      --ink: #E8EAE6; --ink-soft: #9AA09A; --rule: #323841;
+      --accent: #6FA8DC; --accent-soft: rgba(111, 168, 220, 0.16);
+      --pass: #6BAF83; --fail: #D97070; --note: #C9A945;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #15171A; --surface: #1E2126; --sunk: #101215;
+    --ink: #E8EAE6; --ink-soft: #9AA09A; --rule: #323841;
+    --accent: #6FA8DC; --accent-soft: rgba(111, 168, 220, 0.16);
+    --pass: #6BAF83; --fail: #D97070; --note: #C9A945;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--ground); }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--body); font-size: 15px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  code {
+    font-family: var(--data); font-size: 0.88em;
+    background: var(--sunk); padding: 0.1em 0.35em; border-radius: 3px;
+  }
+  b, strong { font-weight: 600; color: var(--ink); }
+  a { color: var(--accent); }
+{{EXTRA_CSS}}
+{{PRINT_CSS}}
+</style>
+</head>
+<body>
+{{BODY}}
+{{SCRIPT}}
+</body>
+</html>
+"""
+
+SHEET_CSS = """
+  .sheet {
+    max-width: 1500px; margin: 0 auto; padding: 28px 16px 56px;
+    display: flex; flex-direction: column; gap: 24px;
+  }
+  .masthead {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px;
+    padding-bottom: 14px; border-bottom: 2px solid var(--ink);
+  }
+  .ticket {
+    font-family: var(--data); font-size: 13px; font-weight: 500; letter-spacing: 0.06em;
+    color: var(--accent); padding: 2px 7px; border: 1px solid var(--accent); border-radius: 2px;
+  }
+  .sheet h1 {
+    font-family: var(--display); font-weight: 700; font-size: clamp(26px, 5vw, 38px);
+    line-height: 1.05; letter-spacing: -0.01em; margin: 0; text-wrap: balance; flex: 1 1 320px;
+  }
+  .sheet-kind, .block-label {
+    font-family: var(--display); font-weight: 600; font-size: 11px;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--ink-soft);
+  }
+  .block-label { margin: 0 0 -8px; }
+  .intro { margin: 0; max-width: 900px; color: var(--ink-soft); }
+
+  .callout {
+    display: flex; gap: 12px; align-items: flex-start; background: var(--surface);
+    border-left: 3px solid var(--note); padding: 12px 14px; font-size: 13.5px; color: var(--ink-soft);
+  }
+  .callout.closing { border-left-color: var(--accent); }
+  .callout p { margin: 0; }
+  .callout-mark {
+    font-family: var(--display); font-weight: 700; font-size: 11px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--note); white-space: nowrap; padding-top: 2px;
+  }
+  .callout.closing .callout-mark { color: var(--accent); }
+
+  .meta {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1px; margin: 0; background: var(--rule); border: 1px solid var(--rule);
+  }
+  .meta div { background: var(--surface); padding: 10px 13px; display: flex; flex-direction: column; gap: 3px; }
+  .meta dt {
+    font-family: var(--display); font-weight: 600; font-size: 10.5px;
+    letter-spacing: 0.13em; text-transform: uppercase; color: var(--ink-soft);
+  }
+  .meta dd { margin: 0; font-family: var(--data); font-size: 13px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
+  .scenarios {
+    list-style: none; margin: 9px 0 0; padding: 0; display: flex; flex-direction: column;
+    gap: 1px; background: var(--rule); border: 1px solid var(--rule);
+  }
+  .scenarios li { background: var(--surface); display: flex; gap: 12px; align-items: baseline; padding: 9px 13px; font-size: 14px; }
+  .verdict {
+    font-family: var(--data); font-size: 11px; font-weight: 500; letter-spacing: 0.04em;
+    padding: 1px 6px; border-radius: 2px; white-space: nowrap; flex: 0 0 auto;
+  }
+  .verdict.pass { color: var(--pass); background: color-mix(in srgb, var(--pass) 13%, transparent); }
+  .verdict.note { color: var(--note); background: color-mix(in srgb, var(--note) 15%, transparent); }
+  .verdict.fail { color: var(--fail); background: color-mix(in srgb, var(--fail) 13%, transparent); }
+  .frame-ref { margin-left: auto; font-family: var(--data); font-size: 11.5px; color: var(--ink-soft); white-space: nowrap; }
+
+  .surface { border-top: 1px solid var(--rule); padding-top: 18px; display: flex; flex-direction: column; gap: 12px; }
+  .surface-h { display: flex; align-items: baseline; gap: 10px; }
+  .surface-no { font-family: var(--data); font-size: 12px; color: var(--accent); }
+  .sheet h2 { font-family: var(--display); font-weight: 700; font-size: 20px; line-height: 1.2; margin: 0; }
+  .caption { margin: 0; max-width: 900px; font-size: 14px; color: var(--ink-soft); }
+
+  .strip { display: grid; gap: 16px; align-items: start; }
+  .strip.row { grid-template-columns: var(--cols); }
+  .strip.wrap { grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); }
+  @media (max-width: 760px) { .strip.row { grid-template-columns: minmax(0, 1fr); } }
+
+  figure.frame { margin: 0; background: var(--surface); border: 1px solid var(--rule); display: flex; flex-direction: column; min-width: 0; }
+  .frame-head { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-bottom: 1px solid var(--rule); min-width: 0; }
+  .frame-no {
+    font-family: var(--data); font-size: 11px; font-weight: 500; color: var(--surface);
+    background: var(--accent); padding: 1px 5px; border-radius: 2px; font-variant-numeric: tabular-nums;
+  }
+  .frame-state {
+    font-family: var(--display); font-weight: 700; font-size: 11.5px;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink);
+  }
+  .frame-state.before { color: var(--ink-soft); }
+  .frame-state.after { color: var(--pass); }
+  .frame-dims {
+    margin-left: auto; font-family: var(--data); font-size: 11px; color: var(--ink-soft);
+    font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .frame button.shot { display: block; background: var(--sunk); line-height: 0; padding: 0; border: 0; width: 100%; cursor: zoom-in; }
+  .frame img { width: 100%; height: auto; display: block; }
+  .frame button.shot:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  figcaption { padding: 9px 11px 11px; font-size: 13.5px; color: var(--ink-soft); border-top: 1px solid var(--rule); }
+
+  .notes { margin: 0; padding-left: 18px; display: grid; gap: 5px; font-size: 13.5px; max-width: 1000px; }
+  .pill {
+    display: inline-block; font-family: var(--data); font-size: 11px; padding: 0 6px; margin-right: 7px;
+    border-radius: 2px; color: var(--accent); background: var(--accent-soft);
+  }
+
+  .access { background: var(--surface); border: 1px solid var(--rule); padding: 15px 16px; }
+  .access ul { margin: 9px 0 0; padding: 0; list-style: none; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 22px; }
+  .access li { font-size: 13.5px; color: var(--ink-soft); display: flex; flex-direction: column; gap: 1px; }
+  .access kbd {
+    font-family: var(--data); font-size: 12px; color: var(--ink); background: var(--sunk);
+    border: 1px solid var(--rule); border-radius: 3px; padding: 1px 5px; align-self: flex-start;
+  }
+  footer {
+    font-family: var(--data); font-size: 11.5px; color: var(--ink-soft);
+    border-top: 1px solid var(--rule); padding-top: 12px; display: flex; flex-wrap: wrap; gap: 4px 18px;
+  }
+
+  .lightbox { position: fixed; inset: 0; z-index: 60; background: rgba(8, 10, 12, 0.94); display: flex; flex-direction: column; }
+  .lightbox[hidden] { display: none; }
+  .lb-bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px;
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    border-bottom: 1px solid rgba(255, 255, 255, 0.14); color: #E8EAE6;
+  }
+  .lb-title { font-family: var(--data); font-size: 12px; letter-spacing: 0.04em; margin-right: auto; }
+  .lb-count { font-family: var(--data); font-size: 12px; font-variant-numeric: tabular-nums; color: rgba(232, 234, 230, 0.6); }
+  .lb-bar button {
+    font-family: var(--display); font-weight: 600; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: #E8EAE6; background: rgba(255, 255, 255, 0.09); border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 3px; padding: 5px 10px; cursor: pointer;
+  }
+  .lb-bar button#lb-prev, .lb-bar button#lb-next { font-family: var(--body); font-size: 17px; line-height: 1; letter-spacing: 0; padding: 3px 11px 5px; }
+  .lb-bar button:hover { background: rgba(255, 255, 255, 0.17); }
+  .lb-bar button:focus-visible { outline: 2px solid #6FA8DC; outline-offset: 2px; }
+  .lb-stage {
+    flex: 1; overflow: auto; display: flex; align-items: flex-start; justify-content: center;
+    padding: 14px; padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  }
+  .lb-stage img { display: block; background: #101215; }
+  .lb-stage.fit img { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; margin: auto; }
+  .lb-stage.actual img { max-width: none; max-height: none; width: auto; height: auto; }
+  .lb-stage.actual { cursor: grab; align-items: center; }
+"""
+
+DOC_CSS = """
+  body { font-size: 16px; line-height: 1.65; }
+  .bar {
+    position: sticky; top: 0; z-index: 10; background: var(--surface);
+    border-bottom: 1px solid var(--rule); padding: 9px 16px;
+    font-family: var(--data); font-size: 12px; color: var(--ink-soft);
+    display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  }
+  .bar .path { color: var(--ink); user-select: all; overflow-wrap: anywhere; }
+  main.doc { max-width: 980px; margin: 0 auto; padding: 32px 16px 120px; }
+  .doc h1, .doc h2, .doc h3, .doc h4 { font-family: var(--display); line-height: 1.2; margin: 1.7em 0 0.55em; }
+  .doc h1 {
+    font-weight: 700; font-size: clamp(28px, 5vw, 40px); letter-spacing: -0.01em;
+    margin-top: 0.2em; padding-bottom: 0.3em; border-bottom: 2px solid var(--ink); text-wrap: balance;
+  }
+  .doc h2 { font-weight: 700; font-size: 1.55em; padding-top: 0.7em; border-top: 1px solid var(--rule); }
+  .doc h3 { font-weight: 600; font-size: 1.2em; }
+  .doc h4 {
+    font-weight: 600; font-size: 0.8em; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-soft);
+  }
+  .doc a { text-decoration: none; }
+  .doc a:hover { text-decoration: underline; }
+  .headerlink { visibility: hidden; margin-left: 0.4em; font-weight: 400; color: var(--ink-soft); }
+  .doc h1:hover .headerlink, .doc h2:hover .headerlink, .doc h3:hover .headerlink { visibility: visible; }
+  .doc p, .doc ul, .doc ol, .doc blockquote, .doc dl { margin: 0 0 1em; }
+  .doc li { margin: 0.25em 0; }
+  .doc li > p { margin: 0; }
+  .doc pre {
+    background: var(--surface); padding: 14px 16px; border-radius: 4px;
+    overflow-x: auto; border: 1px solid var(--rule); font-size: 0.9em; line-height: 1.5;
+  }
+  .doc pre code { background: none; padding: 0; }
+  .codehilite { background: none !important; }
+  .doc blockquote {
+    margin-left: 0; padding: 0.6em 1em; color: var(--ink-soft);
+    border-left: 3px solid var(--accent); background: var(--surface);
+  }
+  .doc blockquote > :last-child { margin-bottom: 0; }
+  .tablewrap { overflow-x: auto; margin: 0 0 1.3em; border: 1px solid var(--rule); }
+  .doc table { border-collapse: collapse; width: 100%; font-size: 0.93em; background: var(--surface); }
+  .doc th, .doc td { border-bottom: 1px solid var(--rule); padding: 8px 12px; text-align: left; vertical-align: top; }
+  .doc th {
+    background: var(--sunk); font-family: var(--display); font-weight: 600; font-size: 0.8em;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-soft); white-space: nowrap;
+  }
+  .doc tbody tr:last-child td { border-bottom: 0; }
+  .doc hr { border: 0; border-top: 1px solid var(--rule); margin: 2em 0; }
+  .doc img { max-width: 100%; border: 1px solid var(--rule); }
+  .admonition { background: var(--surface); border-left: 3px solid var(--note); padding: 10px 14px; margin: 0 0 1em; }
+  .admonition-title {
+    font-family: var(--display); font-weight: 700; font-size: 0.78em; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--note); margin-bottom: 0.3em;
+  }
+"""
+
+LIGHTBOX = """<div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="Enlarged frame">
+  <div class="lb-bar">
+    <span class="lb-title" id="lb-title"></span>
+    <span class="lb-count" id="lb-count"></span>
+    <button type="button" id="lb-prev" aria-label="Previous frame">&lsaquo;</button>
+    <button type="button" id="lb-next" aria-label="Next frame">&rsaquo;</button>
+    <button type="button" id="lb-zoom">Actual size</button>
+    <button type="button" id="lb-close">Close &middot; Esc</button>
+  </div>
+  <div class="lb-stage fit" id="lb-stage"><img id="lb-img" alt=""></div>
+</div>
+"""
+
+LIGHTBOX_JS = """<script>
+  (function () {
+    var box = document.getElementById('lightbox');
+    var stage = document.getElementById('lb-stage');
+    var img = document.getElementById('lb-img');
+    var title = document.getElementById('lb-title');
+    var count = document.getElementById('lb-count');
+    var prevBtn = document.getElementById('lb-prev');
+    var nextBtn = document.getElementById('lb-next');
+    var zoomBtn = document.getElementById('lb-zoom');
+    var closeBtn = document.getElementById('lb-close');
+    var shots = Array.prototype.slice.call(document.querySelectorAll('button.shot'));
+    var index = 0;
+    var lastFocus = null;
+
+    var bar = [prevBtn, nextBtn, zoomBtn, closeBtn];
+    if (shots.length < 2) { prevBtn.hidden = true; nextBtn.hidden = true; count.hidden = true; }
+
+    function setFit(fit) {
+      stage.classList.toggle('fit', fit);
+      stage.classList.toggle('actual', !fit);
+      zoomBtn.textContent = fit ? 'Actual size' : 'Fit to screen';
+      if (!fit) { stage.scrollLeft = (stage.scrollWidth - stage.clientWidth) / 2; }
+    }
+
+    // Holding zoom + scroll across a swap turns the arrows into a blink comparator.
+    function show(i, keepView) {
+      index = (i + shots.length) % shots.length;
+      var btn = shots[index];
+      var source = btn.querySelector('img');
+      var left = stage.scrollLeft;
+      var top = stage.scrollTop;
+
+      lastFocus = btn;
+      img.src = source.src;
+      img.alt = source.alt;
+      title.textContent = btn.dataset.title || '';
+      count.textContent = (index + 1) + ' / ' + shots.length;
+
+      if (keepView) {
+        stage.scrollLeft = left;
+        stage.scrollTop = top;
+      } else {
+        setFit(true);
+      }
+    }
+
+    function open(btn) { show(shots.indexOf(btn), false); box.hidden = false; closeBtn.focus(); }
+
+    function close() {
+      box.hidden = true;
+      img.removeAttribute('src');
+      if (lastFocus) { lastFocus.focus(); }
+    }
+
+    shots.forEach(function (btn) {
+      btn.addEventListener('click', function () { open(btn); });
+    });
+
+    prevBtn.addEventListener('click', function () { show(index - 1, true); });
+    nextBtn.addEventListener('click', function () { show(index + 1, true); });
+    zoomBtn.addEventListener('click', function () { setFit(!stage.classList.contains('fit')); });
+    closeBtn.addEventListener('click', close);
+    stage.addEventListener('click', function (e) { if (e.target === stage) { close(); } });
+
+    document.addEventListener('keydown', function (e) {
+      if (box.hidden) { return; }
+      if (e.key === 'Escape') { close(); return; }
+      if (e.key === 'ArrowLeft') { e.preventDefault(); show(index - 1, true); return; }
+      if (e.key === 'ArrowRight') { e.preventDefault(); show(index + 1, true); return; }
+      // Tab is trapped to the bar controls so focus can't wander behind the overlay.
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        var live = bar.filter(function (b) { return !b.hidden; });
+        var at = live.indexOf(document.activeElement);
+        live[(at + (e.shiftKey ? -1 : 1) + live.length) % live.length].focus();
+      }
+    });
+  })();
+</script>"""
+
+
+PRINT_CSS = """
+  @page { size: letter {{ORIENTATION}}; margin: 12mm; }
+  @media print {
+    :root, :root[data-theme="dark"], :root:not([data-theme="light"]) {
+      --ground: #FFFFFF; --surface: #FFFFFF; --sunk: #F1F2EF;
+      --ink: #1A1C19; --ink-soft: #4A4E47; --rule: #C7C9C2;
+      --accent: #2B5E8E; --accent-soft: rgba(43, 94, 142, 0.12);
+      --pass: #3F7D55; --fail: #9B2C2C; --note: #8A6D1F;
+    }
+    html, body { background: #FFFFFF; font-size: 12.5px; }
+    * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .lightbox, .viewer-hint, .bar, .headerlink { display: none !important; }
+    .sheet { max-width: none; padding: 0; gap: 14px; }
+    /* A section moves to the next page whole, so a heading never strands above its frames;
+       the image cap leaves room on that page for the heading, caption and frame bar. */
+    .surface { padding-top: 10px; break-inside: avoid; }
+    .surface-h, .caption, .doc h1, .doc h2, .doc h3 { break-after: avoid; }
+    figure.frame, .meta, .callout, .scenarios li, .doc pre, .tablewrap, .doc img { break-inside: avoid; }
+    footer { break-before: avoid; }
+    .frame button.shot { cursor: default; }
+    .frame img { max-height: 140mm; width: auto; max-width: 100%; margin: 0 auto; object-fit: contain; }
+    main.doc { max-width: none; padding: 0; }
+    .tablewrap { overflow: visible; }
+  }
+"""
+
+
+# ---------------------------------------------------------------- cli
+
+
+# Chromium's headless-only build (e.g. Fedora's chromium-headless), preferred where installed: a
+# server needs no desktop libs. Not WeasyPrint: it can't lay out sheets (no grid auto-fit).
+HEADLESS_SHELL = Path("/usr/lib64/chromium-browser/headless_shell")
+BROWSERS = ("chromium-browser", "chromium", "google-chrome", "google-chrome-stable")
+
+
+def pdf_browser():
+    if HEADLESS_SHELL.is_file():
+        return str(HEADLESS_SHELL)
+    return next((b for b in map(shutil.which, BROWSERS) if b), None) or die(
+        f"--pdf needs Chromium's headless shell or one of {', '.join(BROWSERS)} on PATH"
+    )
+
+
+def print_pdf(html_path):
+    browser = pdf_browser()
+    dest = html_path.with_suffix(".pdf")
+    # A throwaway profile, so a running debug Chromium on the default profile can't swallow the job.
+    with tempfile.TemporaryDirectory(prefix="present-pdf-") as profile:
+        run = subprocess.run(
+            [
+                browser, "--headless=new", "--disable-gpu", "--no-first-run",
+                f"--user-data-dir={profile}", "--no-pdf-header-footer",
+                "--virtual-time-budget=8000",  # lets the web fonts land before printing
+                f"--print-to-pdf={dest}", html_path.as_uri(),
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+    if run.returncode != 0 or not dest.is_file():
+        die(f"pdf print failed for {html_path}: {run.stderr.strip()[-400:]}")
+    return dest
+
+
+def open_pages(paths):
+    opener = os.environ.get("PRESENT_OPENER") or shutil.which("xdg-open") or shutil.which("open")
+    if not opener:
+        print("present: no opener found (set PRESENT_OPENER); pages were written but not opened", file=sys.stderr)
+        return
+    for p in paths:
+        # Detached, so a cold browser doesn't hold this command open for its lifetime.
+        subprocess.Popen([opener, p.as_uri()], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def cmd_sheet(args):
+    try:
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"can't read manifest: {e}")
+    base = args.manifest.resolve().parent
+    lead = manifest.get("tag") or manifest.get("title", "")
+    name = slugify(f"{lead} {manifest.get('kind', 'proof sheet')}")
+    out = (args.out or base / f"{name}.html").expanduser().resolve()
+    count, copied = build_sheet(manifest, base, out, args.linked)
+    size = out.stat().st_size
+    print(f"{out}  ({count} frames, {size // 1024} KB)")
+    for rel, src in copied:
+        print(f"  {rel} <- {src}")
+    if size > ARTIFACT_PAGE_LIMIT:
+        print("present: over 15 MB — too big for an Artifact page; use --linked or fewer frames", file=sys.stderr)
+    if args.pdf:
+        print(print_pdf(out))
+    if args.open:
+        open_pages([out])
+
+
+def cmd_doc(args):
+    roots = []
+    for a in args.files:
+        p = Path(a).expanduser().resolve()
+        if not p.is_file():
+            die(f"not a file: {p}")
+        roots.append(p)
+
+    queue, done = list(roots), {}
+    while queue and len(done) < MAX_DOCS:
+        src = queue.pop(0)
+        if src in done:
+            continue
+        done[src] = render_doc(src, queue, not args.no_follow)
+
+    for src in roots:
+        print(done[src])
+        if args.pdf:
+            print(print_pdf(done[src]))
+    if args.open:
+        open_pages([done[src] for src in roots])
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="present", description="Render pictures or a markdown doc as one styled HTML page.")
+    sub = ap.add_subparsers(dest="mode", required=True)
+
+    sp = sub.add_parser("sheet", help="screenshots + captions from a JSON manifest")
+    sp.add_argument("manifest", type=Path)
+    sp.add_argument("-o", "--out", type=Path)
+    sp.add_argument("--linked", action="store_true", help="copy images to shots/ instead of embedding (Artifact publish)")
+    sp.add_argument("--open", action="store_true", help="open with $PRESENT_OPENER, else xdg-open or open")
+    sp.add_argument("--pdf", action="store_true", help="also print the page to a .pdf beside it")
+    sp.set_defaults(run=cmd_sheet)
+
+    dp = sub.add_parser("doc", help="markdown file(s) to a read-only styled copy")
+    dp.add_argument("files", nargs="+")
+    dp.add_argument("--open", action="store_true", help="open each root with $PRESENT_OPENER, else xdg-open or open")
+    dp.add_argument("--no-follow", action="store_true", help="don't render linked .md files")
+    dp.add_argument("--pdf", action="store_true", help="also print each root page to a .pdf beside it")
+    dp.set_defaults(run=cmd_doc)
+
+    args = ap.parse_args()
+    args.run(args)
+
+
+if __name__ == "__main__":
+    main()

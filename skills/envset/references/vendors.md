@@ -1,0 +1,39 @@
+# Vetted vendors — mint, scope, verify
+
+Lengths are what has actually come through `envset`, not vendor docs; a length that's off by a lot is a truncated or doubled paste. Dashboard URLs move — if one 404s, fix the row. Every probe below is `curl -s -o /dev/null -w '%{http_code}'` unless it says otherwise; `-s` matters for the vendors that carry the token in the URL.
+
+| Vendor | Mint at | Scope to ask for | Length | Verify probe | Gotcha |
+|---|---|---|---|---|---|
+| **Resend** | https://resend.com/api-keys | *Sending access* if it only sends; **Full access** to create/verify domains. Can pin to one domain. | 36 (`re_…`) | `GET https://api.resend.com/domains` → 200 (also lists what's verified) | Reputation is per *domain*, not per account — a second brand gets its own sending subdomain, not a second account. The free tier accepts a second domain. |
+| **Cloudflare** (DNS) | https://dash.cloudflare.com/profile/api-tokens — **User** tokens live here | Template **Edit zone DNS**; Zone Resources → Include → **Specific zone** → the one zone. | 40–53 | `GET …/zones?name=<zone>` must return exactly 1 — that's the scope check. **Probe the resource, not `/user/tokens/verify`** (see the Turnstile row). | 19 chars = truncated paste (seen). Snapshot `dns_records` before bulk writes; diff after. |
+| **Cloudflare** (Turnstile) | Dashboard → **Manage account → Account API tokens** → Create Token → Custom. NOT under My Profile — that page holds *user* tokens and can look empty while account tokens exist. | **Account · Turnstile · Edit** on the one account, nothing else. Write includes read. | 53 | `GET https://api.cloudflare.com/client/v4/accounts/<acct>/challenges/widgets` → `success: true` | ⚠️ **`/user/tokens/verify` returns `success:false` for an ACCOUNT-owned token** — it only covers user tokens, so the documented Cloudflare probe reads as a dead token when the token is fine. Always probe the resource endpoint. A DNS-scoped token cannot mint this one (`/user/tokens` and `/accounts/{id}/tokens` both 403), so it is an irreducible human step. Get the `<acct>` id from `GET /zones` → `.result[].account.id`. |
+| **Supabase** (Management API) | https://supabase.com/dashboard/account/tokens | Project-scoped (one project) — but **Permissions must be the `Full access` preset** if the token will WRITE. Set an expiry. | 44 (`sbp_…`) | read: `GET https://api.supabase.com/v1/projects/<ref>/config/auth` → 200. **write: no-op `PATCH` the same path with a current value → 200.** | Resource-scope and permissions are **separate axes** — narrow the first, not the second. A project-scoped token with the single capability `Auth Config = Write` reads 200 and `PATCH`es **403** on every field; the same project scope with `Full access` writes fine. Confirm reach with `GET /v1/projects` — it returns a **filtered 200** listing only in-scope projects (it does *not* 403). |
+| **Railway** | https://railway.com/account/tokens | *Project* token for one project/env; *Account* token only if it must span projects. | 36 (UUID) | `POST https://backboard.railway.com/graphql/v2` body `{"query":"{ me { email } }"}` → 200 with data (account token). Project tokens use header `Project-Access-Token`, not Bearer. | The OAuth token in `~/.railway/config.json` refreshes hourly — useless for cron/automation; mint a durable one. `railway variables` **prints values** — never run it to check. |
+| **Vercel** | https://vercel.com/account/tokens | Pick the team scope; set an expiry. | 24 | `GET https://api.vercel.com/v2/user` → 200 | `vercel env pull` already covers most needs — you rarely need a token in `.env`. |
+| **Stripe** | https://dashboard.stripe.com/apikeys | A **restricted key** (`rk_`) with only the resources needed; never the full `sk_live_` for automation. Check the live/test toggle. | ~107 | Probe the resource the key is scoped for; unrestricted: `GET https://api.stripe.com/v1/balance` → 200 | Prefix tells mode: `_live_` vs `_test_`. With more than one Stripe account, confirm which one you're in before minting. |
+| **GitHub** | https://github.com/settings/personal-access-tokens | **Fine-grained**, pinned to the repo(s), minimal permissions. | 93 (`github_pat_`) / 40 (`ghp_`) | `GET https://api.github.com/user` → 200; classic tokens expose scope in the `X-OAuth-Scopes` response header | `gh auth` handles nearly everything — a PAT in `.env` is rarely the answer. |
+| **Atlassian / Jira** | https://id.atlassian.com/manage-profile/security/api-tokens | Scoped token: Jira + the specific scopes. | 192 (`ATATT…`) | `GET https://<site>.atlassian.net/rest/api/3/myself` with `-u email:token` → 200 | **Basic auth, not Bearer.** |
+| **Telegram bot** | @BotFather → `/newbot` or `/token` | None (bot-wide). | ~46 (`digits:…`) | `GET https://api.telegram.org/bot<TOKEN>/getMe` → 200 | Token rides in the **URL path** — keep `-s`, never `-v`, and don't let a failing command echo its URL. |
+| **Anthropic** | https://console.anthropic.com/settings/keys | Per-workspace key. | ~108 (`sk-ant-…`) | `GET https://api.anthropic.com/v1/models` with `-H "x-api-key: $V" -H "anthropic-version: 2023-06-01"` → 200 | Header is `x-api-key`, not Bearer. |
+| **OpenAI** | https://platform.openai.com/api-keys | **Project** key, restricted permissions. | long (`sk-proj-…`) | `GET https://api.openai.com/v1/models` → 200 | — |
+| **Intrinio** | https://account.intrinio.com | Single account key. | 44 | `GET https://api-v2.intrinio.com/securities/AAPL/prices?page_size=1&api_key=$V` → 200 | Key in the **query string** — same `-s`-only caveat as Telegram. Entitlement ≠ auth: a 200 here says nothing about which products the key can reach (`get_account_access_codes` is the truth). |
+| **SnapTrade** | Dashboard → Credentials | clientId + consumerKey pair. | 19 + 50 | Requests are **HMAC-signed** — no bare-curl probe. Verify through the backend's own client. | Two values, one vendor: store both before testing either. |
+| **Spotify** (Web API, PKCE) | https://developer.spotify.com/dashboard → Create app. Owner account must be **Premium** (a dev-mode rule). | Only the **Client ID** — the app is used via Authorization Code + PKCE, so the client secret is never stored. The redirect URI must match your app's exactly and use `127.0.0.1` (`localhost` is rejected); tick *Web API*. | 32 hex | **No bare-curl probe**: `/authorize` redirects to login before validating, and `/api/token` checks the grant before the client id (a bogus id + bogus refresh token → `invalid_grant`). The probe is the interactive `auth` run — a bad id or unregistered redirect shows `INVALID_CLIENT` on Spotify's page right after login. | Refresh tokens expire **6 months after the original authorization** regardless of use — track the expiry. Dev mode: 5 users, lower rate limits, daily quota (`429` + `QUOTA_EXCEEDED`). |
+
+Not this skill: **Google / clasp** (`npx clasp login` — interactive OAuth, not a pasted token) and any **MCP OAuth** flow. Those are "the user clicks through once," and there's nothing to `envset`.
+
+## SimpleFIN Bridge
+
+Mint: https://beta-bridge.simplefin.org/ → (logged in) → New App Connection /
+Setup Token. Scope = whichever institutions you've linked — the token grants
+read-only transactions for ALL of them, so scoping happens at link time, not
+token time. Shape: base64 blob, ~100–200 chars, encoding a claim URL.
+Verify: claim (POST the decoded URL) → durable access URL → GET
+`<access>/accounts` returns JSON `{"accounts":[…]}`. Gotcha: the setup token
+is **one-time** — the first claim consumes it; a second claim of the same
+token fails, so a botched claim means minting a fresh token, not retrying.
+The claimed access URL embeds basic-auth credentials — it's the real secret.
+
+## Adding a row
+
+Mint URL · narrowest useful scope · observed length · the cheapest authenticated GET · the gotcha that would have cost time. Put the gotcha in; it's the column that pays for the file.

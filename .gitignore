@@ -1,0 +1,14 @@
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local-only working files — never publish live config or secrets
+*.local
+.env
+.env.*
+
+# Python bytecode
+__pycache__/

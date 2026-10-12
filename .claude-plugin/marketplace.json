@@ -1,0 +1,24 @@
+{
+  "name": "ohokayyeah",
+  "owner": {
+    "name": "OHOKAYYEAH"
+  },
+  "metadata": {
+    "description": "A working suite of Claude Code skills — the portable craft of one developer's workflow, shared to browse and borrow.",
+    "version": "2026.10"
+  },
+  "plugins": [
+    {
+      "name": "skills-suite",
+      "source": "./",
+      "description": "57 skills for portable craft: test-first development, mutation testing, layered review pipelines, decision support, and session-lifecycle helpers. Tier 1-3 from the catalog; the Tier-4 project examples live in examples/ and are not installed.",
+      "defaultEnabled": false
+    },
+    {
+      "name": "tldw",
+      "source": "./plugins/tldw",
+      "description": "/tldw: distill a YouTube video from its transcript into a TL;DR plus the substance, with timestamp links. Pasting a bare YouTube link runs it too.",
+      "defaultEnabled": false
+    }
+  ]
+}

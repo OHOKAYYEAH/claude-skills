@@ -1,0 +1,9 @@
+---
+name: wait
+description: "Park the session as waiting on external input, and nothing else. The done-rename.sh UserPromptSubmit hook prefixes the session title with \"[WAIT]\" and blocks the turn instantly (no LLM turn), because parking is a move-on moment. Use when a session is in progress but blocked on a **non-code answer from outside**: a decision, approval, or information you are waiting on from someone or something else (a stakeholder review, an approval, an upstream answer) before it can move forward. NOT for code/CI/build/deploy blockers. Strips any existing [DONE]/[WAIT]/[TODO] tag first, so states transition cleanly. Sibling of /done."
+disable-model-invocation: true
+---
+
+`/wait` parks the session as **blocked on a non-code answer from outside** (a decision, approval, or info you're waiting on from someone or something else — not a code/CI/deploy blocker) and does nothing else. In normal operation **you will never read this body**: the `done-rename.sh` UserPromptSubmit hook intercepts `/wait`, prefixes the session title with `[WAIT]` (stripping any existing lifecycle tag first, so `[DONE] X` or a bare `X` both become `[WAIT] X`), and **blocks the turn** — no LLM turn, no report. That instant park is the whole point. The tag set: no prefix = active, `[DONE]` = finished and archived, `[WAIT]` = blocked on outside input.
+
+**Fallback — if you ARE executing this body**, the hook did not block (settings.json not read, hooks disabled, or the prompt leaked through with different args). Then: emit a single clean one-line confirmation that the session is parked as `[WAIT]`, do nothing else (no report, no codify), and flag the wiring — check the `UserPromptSubmit` entry in your `settings.json` and the `done-rename.sh` script it points at (see `substrate/hooks/README.md` in this repo for the install).

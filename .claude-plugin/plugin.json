@@ -1,0 +1,9 @@
+{
+  "name": "skills-suite",
+  "version": "2026.10.10",
+  "description": "57 skills for portable craft: test-first development (/tdd), mutation testing (/mutate), layered review (/super-review, /blast-radius, /sec-review), decision support (/recommend, /interview), and session lifecycle (/handoff, /done). Shared for reading and borrowing, so it installs turned off: enable it only if you want these skills live. See README.md for the portability-tiered catalog and SETUP.md for the substrate some skills need.",
+  "author": {
+    "name": "OHOKAYYEAH"
+  },
+  "defaultEnabled": false
+}

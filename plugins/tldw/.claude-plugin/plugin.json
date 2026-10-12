@@ -1,0 +1,9 @@
+{
+  "name": "tldw",
+  "version": "2026.10.09",
+  "description": "/tldw: too long; didn't watch. Distills a YouTube video from its transcript: a TL;DR on top, then the substance in one of three shapes (themes, argument, timeline), with timestamp links on every point. Pasting a bare YouTube link runs it too. Needs Claude Code on your own machine and python3; see skills/tldw/README.md.",
+  "author": {
+    "name": "OHOKAYYEAH"
+  },
+  "defaultEnabled": false
+}
